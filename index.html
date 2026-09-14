@@ -1,13 +1,558 @@
-<!doctype html>
+<!DOCTYPE html>
+<!--
+  macOS Installer Catalog — a small, single-file tool for GitHub Pages.
+
+  WHAT IT DOES
+  Apple publishes a giant "software update catalog" file listing every
+  installer it serves, including the full macOS installers (Tahoe, Sequoia,
+  Golden Gate, etc). This page can fetch that catalog live, right in your
+  browser, and show you a clean table of "OS name / version / build / CDN
+  download URL" — the same data `softwareupdate --list-full-installers`
+  shows you on a Mac, but from any browser, and with copyable URLs.
+
+  WHY A "CORS PROXY" IS INVOLVED
+  Apple's catalog server doesn't send the permission headers browsers
+  require for a web page on a *different* domain (like GitHub Pages) to
+  read its response. This is a security feature of browsers, not something
+  we can turn off. The workaround is to route the request through a small
+  proxy service that fetches the file server-side and passes it along with
+  the right headers. Two proxy URLs are configurable below — swap them if
+  one goes down or gets rate-limited.
+
+  HOW IT WORKS, STEP BY STEP
+  1. Fetch the catalog XML (a big plist file) through the proxy.
+  2. Parse it as generic XML into a JS object (see parsePlistXML below).
+  3. Walk the "Products" dictionary. Entries that represent a full macOS
+     installer carry an ExtendedMetaInfo.InstallAssistantPackageIdentifiers
+     .SharedSupport identifier like "com.apple.pkg.InstallAssistant.macOSTahoe".
+     We use that to both find the entry AND derive a friendly OS name.
+  4. Each entry's real version number ("26.7") and build ("25G229") aren't
+     in the main catalog — they live in a tiny per-entry ".dist" file. We
+     fetch those (through the proxy too) and pull the numbers out.
+  5. Render everything into the table below.
+
+  No frameworks, no build step — just open this file, or host it on
+  GitHub Pages.
+-->
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="0; url=macos-installer-catalog.html">
-  <title>macOS Installer Catalog</title>
-  <script>location.replace("macos-installer-catalog.html");</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>macOS Installer Catalog</title>
+<style>
+  :root{
+    --bg: #0d1117;
+    --panel: #12181f;
+    --line: #232b34;
+    --text: #d7dee6;
+    --dim: #7c8894;
+    --accent: #5ee6b0;
+    --accent-dim: #2c6b53;
+    --warn: #e6b85e;
+    --err: #e66a5e;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family: "SF Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+    font-size:14px;}
+  .wrap{max-width:1080px;margin:0 auto;padding:40px 24px 80px;}
+
+  header{border-bottom:1px solid var(--line);padding-bottom:20px;margin-bottom:20px;}
+  .prompt{color:var(--accent);font-size:13px;letter-spacing:.02em;}
+  h1{font-size:22px;font-weight:600;margin:8px 0 6px;color:#fff;letter-spacing:-0.01em;}
+  .sub{color:var(--dim);font-size:13px;line-height:1.6;max-width:640px;}
+
+  .toolbar{display:flex;gap:10px;align-items:center;margin:20px 0 8px;flex-wrap:wrap;}
+  button.primary{
+    background:var(--accent);color:#04140e;border:none;font-weight:600;
+    padding:9px 16px;border-radius:5px;font-family:inherit;font-size:13px;
+    cursor:pointer;transition:.12s;
+  }
+  button.primary:hover{filter:brightness(1.08);}
+  button.primary:disabled{opacity:.5;cursor:default;filter:none;}
+  button.ghost{
+    background:transparent;border:1px solid var(--line);color:var(--dim);
+    padding:9px 14px;border-radius:5px;font-family:inherit;font-size:13px;
+    cursor:pointer;
+  }
+  button.ghost:hover{border-color:var(--accent-dim);color:var(--accent);}
+  input#q{
+    background:var(--panel);border:1px solid var(--line);color:var(--text);
+    padding:9px 12px;border-radius:5px;font-family:inherit;font-size:13px;
+    flex:1;min-width:180px;outline:none;
+  }
+  input#q:focus{border-color:var(--accent-dim);}
+  label.chk{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12.5px;white-space:nowrap;}
+
+  .status{font-size:12.5px;color:var(--dim);min-height:18px;margin:6px 0 16px;display:flex;align-items:center;gap:8px;}
+  .status.err{color:var(--err);}
+  .status.ok{color:var(--accent);}
+  .spinner{width:12px;height:12px;border-radius:50%;border:2px solid var(--line);
+    border-top-color:var(--accent);animation:spin .7s linear infinite;display:none;}
+  .spinner.on{display:inline-block;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  details.adv{margin:6px 0 18px;border:1px solid var(--line);border-radius:6px;background:var(--panel);}
+  details.adv summary{padding:9px 14px;cursor:pointer;color:var(--dim);font-size:12.5px;user-select:none;}
+  details.adv summary:hover{color:var(--text);}
+  .adv-body{padding:4px 14px 14px;display:flex;flex-direction:column;gap:10px;}
+  .adv-field label{display:block;color:var(--dim);font-size:11.5px;margin-bottom:4px;}
+  .adv-field input{
+    width:100%;background:#0a0f14;border:1px solid var(--line);color:var(--text);
+    padding:7px 10px;border-radius:4px;font-family:inherit;font-size:12px;outline:none;
+  }
+  .adv-field input:focus{border-color:var(--accent-dim);}
+  .adv-note{color:var(--dim);font-size:11px;line-height:1.6;}
+
+  table{width:100%;border-collapse:collapse;background:var(--panel);
+    border:1px solid var(--line);border-radius:6px;overflow:hidden;}
+  thead th{
+    text-align:left;padding:10px 14px;font-size:11px;color:var(--dim);
+    font-weight:500;border-bottom:1px solid var(--line);
+  }
+  tbody tr{border-bottom:1px solid var(--line);transition:background .12s;}
+  tbody tr:last-child{border-bottom:none;}
+  tbody tr:hover{background:#161d25;}
+  td{padding:11px 14px;vertical-align:top;}
+  .name{color:#fff;font-weight:600;font-size:13.5px;}
+  .ver{color:var(--accent);font-size:12.5px;}
+  .build{color:var(--dim);font-size:11.5px;}
+  .size{color:var(--text);font-size:12.5px;white-space:nowrap;}
+  .date{color:var(--dim);font-size:11.5px;white-space:nowrap;}
+  .flag{
+    display:inline-block;font-size:10px;color:var(--warn);
+    border:1px solid #4a3e22;background:#241d0f;border-radius:3px;
+    padding:1px 6px;margin-left:6px;
+  }
+  .urlrow{display:flex;align-items:center;gap:8px;}
+  .url{
+    color:var(--dim);font-size:11.5px;max-width:320px;overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap;
+  }
+  button.copy{
+    background:transparent;border:1px solid var(--line);color:var(--dim);
+    padding:4px 9px;border-radius:4px;font-family:inherit;font-size:11px;
+    cursor:pointer;white-space:nowrap;transition:.12s;
+  }
+  button.copy:hover{border-color:var(--accent-dim);color:var(--accent);}
+  button.copy.done{border-color:var(--accent);color:var(--accent);}
+
+  .empty{padding:30px;text-align:center;color:var(--dim);font-size:12.5px;}
+
+  footer{margin-top:22px;color:var(--dim);font-size:11.5px;line-height:1.7;}
+  code.inline{background:var(--panel);border:1px solid var(--line);border-radius:3px;
+    padding:1px 5px;color:var(--accent);}
+</style>
 </head>
 <body>
-  <p>Opening <a href="macos-installer-catalog.html">macOS Installer Catalog</a>…</p>
+<div class="wrap">
+
+  <header>
+    <div class="prompt">$ softwareupdate --list-full-installers</div>
+    <h1>macOS Installer Catalog</h1>
+    <div class="sub">Browse Apple's full macOS installers and their CDN download URLs. Click "Fetch live data" to pull the current catalog straight from Apple, right here in your browser.</div>
+  </header>
+
+  <div class="toolbar">
+    <button class="primary" id="fetchBtn">Fetch live data</button>
+    <button class="ghost" id="resetBtn">Reset to bundled sample</button>
+    <input id="q" type="text" placeholder="Filter by name, version, or build…">
+    <label class="chk"><input type="checkbox" id="showSeeds"> include beta/seed builds</label>
+  </div>
+
+  <div class="status" id="status">
+    <span class="spinner" id="spinner"></span>
+    <span id="statusText">Showing bundled sample data from 2026‑09‑14. Click "Fetch live data" for the current catalog.</span>
+  </div>
+
+  <details class="adv">
+    <summary>Advanced settings (catalog URL, preferred CORS proxy)</summary>
+    <div class="adv-body">
+      <div class="adv-field">
+        <label>Apple catalog URL</label>
+        <input id="catalogUrl" type="text" value="https://swscan.apple.com/content/catalogs/others/index-15seed-15-14-13-12-10.16-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog">
+      </div>
+      <div class="adv-field">
+        <label>Preferred CORS proxy URL prefix (the Apple URL is appended after this)</label>
+        <input id="proxyUrl" type="text" value="https://macos-catalog-proxy.macosinstallers.workers.dev/?url=">
+      </div>
+      <div class="adv-note">
+        The preferred proxy is tried first, followed by a small built-in fallback list. Each attempt has a timeout and the result is cached in this browser to reduce repeat requests. The catalog URL is used exactly as entered (and must be an <code class="inline">https://</code> Apple <code class="inline">.sucatalog</code> URL); this page does not guess replacement Apple catalog endpoints. For reliable published use, use your own small proxy/API that permits only Apple URLs and adds <code class="inline">Access-Control-Allow-Origin: *</code>.
+      </div>
+    </div>
+  </details>
+
+  <table>
+    <thead>
+      <tr>
+        <th>OS</th>
+        <th>Version</th>
+        <th>Build</th>
+        <th>Size</th>
+        <th>Catalog date</th>
+        <th>CDN installer URL</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <footer>
+    <span id="rowcount"></span> entries · Data source: Apple software update catalog<br>
+    Click a row's Copy button to grab the full <code class="inline">.pkg</code> URL for <code class="inline">curl</code>/<code class="inline">wget</code>, or use it with <code class="inline">softwareupdate --fetch-full-installer</code>.
+  </footer>
+
+</div>
+
+<script>
+/* ---------- 1. Bundled sample data (shown before any live fetch, and as a fallback) ---------- */
+const SAMPLE_DATA = [
+  {name:"macOS Golden Gate", version:"27.0",   build:"26A428", size:18400314350, date:"2026-09-14", url:"https://swcdn.apple.com/content/downloads/01/05/142-15488-A_9XNIAXWVVL/5ajxcy8xk014o98zz1uut0zrlaj2nx91ln/InstallAssistant.pkg", seed:false},
+  {name:"macOS Tahoe",       version:"26.7",   build:"25G229", size:18381960622, date:"2026-09-14", url:"https://swcdn.apple.com/content/downloads/52/44/142-16670-A_C1NGFF0VNT/e1mno92ap4g9s6epq5bbee9a57b5tm983g/InstallAssistant.pkg", seed:false},
+  {name:"macOS Tahoe",       version:"26.6.2", build:"25G83",  size:18384624402, date:"2026-08-24", url:"https://swcdn.apple.com/content/downloads/37/33/140-93587-A_GRFFH93NOL/f944yaqo1cjhh2m0kxrl0zhcpg9yb9qphv/InstallAssistant.pkg", seed:false},
+  {name:"macOS Tahoe",       version:"26.6.1", build:"25G76",  size:18368573458, date:"2026-08-06", url:"https://swcdn.apple.com/content/downloads/10/29/140-77964-A_0UTOTNYQBE/i3xi6sdu6ix3hinx00nytw4u0tky6oyswt/InstallAssistant.pkg", seed:false},
+  {name:"macOS Tahoe",       version:"26.6",   build:"25G72",  size:18373464112, date:"2026-07-27", url:"https://swcdn.apple.com/content/downloads/56/57/140-71750-A_ZJ1ETGFD03/dnnk12px38rclkv5ettt24crfqd9w244ua/InstallAssistant.pkg", seed:false},
+  {name:"macOS Tahoe",       version:"26.5.2", build:"25F84",  size:18304277765, date:"2026-07-07", url:"https://swcdn.apple.com/content/downloads/63/03/140-36226-A_WUCZCLWK7K/1elqm2ix9y06je9fgy9rdqed1jod0jgxoe/InstallAssistant.pkg", seed:false},
+  {name:"macOS Tahoe",       version:"26.5.1", build:"25F80",  size:18301025735, date:"2026-06-09", url:"https://swcdn.apple.com/content/downloads/22/07/122-84023-A_RQPL3GX2L6/l6vt7agjz206oaiyhvc0a4wupeffjk36st/InstallAssistant.pkg", seed:false},
+  {name:"macOS Sequoia",     version:"15.8",   build:"24H23",  size:15664077639, date:"2026-09-14", url:"https://swcdn.apple.com/content/downloads/24/14/142-16660-A_CTI1XX4VYC/dwxnuxoud4401qcf8to49p8iq1ij987j1e/InstallAssistant.pkg", seed:false},
+  {name:"macOS Sequoia",     version:"15.7.9", build:"24G830", size:15655958320, date:"2026-08-24", url:"https://swcdn.apple.com/content/downloads/16/08/140-85388-A_3LX3Q36I6P/zxod6nr7zkovvsml6s628z44gdbc4exa5p/InstallAssistant.pkg", seed:false},
+  {name:"macOS Sequoia",     version:"15.7.8", build:"24G824", size:15655690961, date:"2026-07-27", url:"https://swcdn.apple.com/content/downloads/11/25/140-71763-A_J1EVMAEOWN/smk9mja1myiettgeafge6oha4levx39v2i/InstallAssistant.pkg", seed:false},
+  {name:"macOS Sequoia",     version:"15.7.7", build:"24G720", size:15655501868, date:"2026-05-18", url:"https://swcdn.apple.com/content/downloads/08/08/122-77920-A_24DGKW16ZQ/p2g06dyhtgf9mgf2yt1p4ihzvkkk91qvlf/InstallAssistant.pkg", seed:false},
+];
+
+let currentData = SAMPLE_DATA;
+
+/* ---------- 2. A tiny plist-XML → JS object parser ---------- */
+// Apple's catalog is an XML "plist" file. This walks the DOM and turns
+// <dict>/<array>/<string>/<integer>/etc into a plain JS object, the same
+// shape Python's plistlib gives you.
+function parsePlistNode(node) {
+  switch (node.tagName) {
+    case "dict": {
+      const obj = {};
+      const kids = Array.from(node.children);
+      for (let i = 0; i < kids.length; i += 2) {
+        obj[kids[i].textContent] = parsePlistNode(kids[i + 1]);
+      }
+      return obj;
+    }
+    case "array":
+      return Array.from(node.children).map(parsePlistNode);
+    case "string":
+      return node.textContent;
+    case "integer":
+      return parseInt(node.textContent, 10);
+    case "real":
+      return parseFloat(node.textContent);
+    case "true":
+      return true;
+    case "false":
+      return false;
+    case "date":
+      return node.textContent; // ISO string, good enough to display/sort
+    default:
+      return null; // <data> and anything else we don't need
+  }
+}
+function parsePlistXML(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+  const err = doc.querySelector("parsererror");
+  if (err) throw new Error("Couldn't parse the catalog as XML.");
+  const rootDict = doc.querySelector("plist > dict");
+  if (!rootDict) throw new Error("Unexpected catalog format.");
+  return parsePlistNode(rootDict);
+}
+
+/* ---------- 3. Turn a raw identifier into a display name ---------- */
+// e.g. "macOSGoldenGate" -> "macOS Golden Gate", "macOSBigSur" -> "macOS Big Sur"
+function friendlyOSName(rawName) {
+  if (!rawName.startsWith("macOS")) return rawName;
+  const rest = rawName.slice(5).replace(/([a-z0-9])([A-Z])/g, "$1 $2");
+  return "macOS " + rest;
+}
+
+function fmtSize(bytes) {
+  return (bytes / 1024 ** 3).toFixed(2) + " GB";
+}
+
+/* ---------- 4. Resilient fetch helpers (proxy fallback, timeout, cache) ---------- */
+const FETCH_TIMEOUT_MS = 12000;
+const DIST_TIMEOUT_MS = 6000;
+const DIST_CONCURRENCY = 5;
+const CATALOG_CACHE_MS = 15 * 60 * 1000;
+const DIST_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
+const FALLBACK_PROXY_PREFIXES = [
+  "https://api.allorigins.win/raw?url=",
+  "https://corsproxy.io/?url=",
+  "https://api.codetabs.com/v1/proxy?quest=",
+];
+
+function cacheKey(url) {
+  return "macos-installer-catalog:fetch:" + encodeURIComponent(url);
+}
+
+function readCachedText(url, ttl) {
+  try {
+    const item = JSON.parse(localStorage.getItem(cacheKey(url)) || "null");
+    if (item && typeof item.text === "string" && Date.now() - item.savedAt < ttl) return item.text;
+  } catch (_) { /* Storage can be unavailable or contain stale malformed data. */ }
+  return null;
+}
+
+function writeCachedText(url, text) {
+  try { localStorage.setItem(cacheKey(url), JSON.stringify({ savedAt: Date.now(), text })); }
+  catch (_) { /* A full/private browser store should not prevent live loading. */ }
+}
+
+function validateCatalogUrl(value) {
+  let url;
+  try { url = new URL(value); } catch (_) { throw new Error("Catalog URL is not a valid URL."); }
+  if (url.protocol !== "https:" || !/(^|\.)apple\.com$/i.test(url.hostname) || !/\.sucatalog$/i.test(url.pathname)) {
+    throw new Error("Catalog URL must be an HTTPS Apple .sucatalog URL; it was not changed automatically.");
+  }
+  return url.href;
+}
+
+function proxyCandidates(workingProxy) {
+  const preferred = document.getElementById("proxyUrl").value.trim();
+  // Once a proxy succeeds for the catalog, prefer it for every .dist request.
+  // This avoids retrying a known-bad proxy 22 times.
+  return [...new Set([workingProxy, preferred, ...FALLBACK_PROXY_PREFIXES].filter(Boolean))];
+}
+
+function proxyLabel(prefix) {
+  try { return new URL(prefix).hostname; }
+  catch (_) { return "custom proxy"; }
+}
+
+async function fetchWithTimeout(target, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(target, { signal: controller.signal, cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.text();
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("timed out after " + (timeoutMs / 1000) + "s");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function proxiedFetchText(url, { ttl, diagnostics, validate = () => true, timeoutMs = FETCH_TIMEOUT_MS }) {
+  const cached = readCachedText(url, ttl);
+  if (cached !== null && validate(cached)) {
+    diagnostics.cacheHits++;
+    return cached;
+  }
+  const failures = [];
+  for (const prefix of proxyCandidates(diagnostics.workingProxy)) {
+    try {
+      const text = await fetchWithTimeout(prefix + encodeURIComponent(url), timeoutMs);
+      if (!text.trim()) throw new Error("empty response");
+      if (!validate(text)) throw new Error("unexpected response");
+      writeCachedText(url, text);
+      diagnostics.proxies.add(prefix);
+      diagnostics.workingProxy = prefix;
+      return text;
+    } catch (error) {
+      failures.push(proxyLabel(prefix) + ": " + (error.message || "request failed"));
+    }
+  }
+  diagnostics.failures.push(...failures);
+  throw new Error("all proxy attempts failed (" + failures.join("; ") + ")");
+}
+
+// Pull VERSION / BUILD out of a product's small .dist metadata file.
+function extractVersionBuild(distText) {
+  const vMatch = distText.match(/<key>VERSION<\/key>\s*<string>([^<]+)<\/string>/);
+  const bMatch = distText.match(/<key>BUILD<\/key>\s*<string>([^<]+)<\/string>/);
+  return {
+    version: vMatch ? vMatch[1] : null,
+    build: bMatch ? bMatch[1] : null,
+  };
+}
+
+// Run a list of async job functions with limited concurrency, so we don't
+// overload a public proxy. Five requests keeps a first live refresh practical.
+async function runWithConcurrency(jobs, limit, onProgress) {
+  const results = new Array(jobs.length);
+  let next = 0, done = 0;
+  async function worker() {
+    while (next < jobs.length) {
+      const i = next++;
+      try { results[i] = await jobs[i](); }
+      catch (e) { results[i] = null; }
+      done++;
+      if (onProgress) onProgress(done, jobs.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, worker));
+  return results;
+}
+
+/* ---------- 5. Main fetch flow, triggered by the button ---------- */
+async function fetchLiveCatalog() {
+  const btn = document.getElementById("fetchBtn");
+  const spinner = document.getElementById("spinner");
+  const statusEl = document.getElementById("status");
+  const statusText = document.getElementById("statusText");
+
+  btn.disabled = true;
+  spinner.classList.add("on");
+  statusEl.classList.remove("err", "ok");
+  statusText.textContent = "Fetching catalog from Apple…";
+
+  try {
+    const diagnostics = { proxies: new Set(), failures: [], cacheHits: 0, distFailures: 0 };
+    const catalogUrl = validateCatalogUrl(document.getElementById("catalogUrl").value.trim());
+    const xmlText = await proxiedFetchText(catalogUrl, {
+      ttl: CATALOG_CACHE_MS,
+      diagnostics,
+      validate: text => /<plist(?:\s|>)/i.test(text),
+    });
+    const plist = parsePlistXML(xmlText);
+    const products = plist.Products || {};
+
+    // Find every product that represents a full macOS installer.
+    const candidates = [];
+    for (const [pid, p] of Object.entries(products)) {
+      const emi = p.ExtendedMetaInfo;
+      const iap = emi && emi.InstallAssistantPackageIdentifiers;
+      const sharedSupport = iap && iap.SharedSupport;
+      if (!sharedSupport) continue;
+      if (!sharedSupport.startsWith("com.apple.pkg.InstallAssistant.")) continue;
+
+      let raw = sharedSupport.replace("com.apple.pkg.InstallAssistant.", "");
+      const isSeed = raw.startsWith("Seed.");
+      if (isSeed) raw = raw.replace("Seed.", "");
+
+      const packages = p.Packages || [];
+      const pkg = packages.find(pk => /InstallAssistant\.pkg$/i.test(pk.URL || ""))
+               || packages.filter(pk => /\.pkg$/i.test(pk.URL || "")).sort((a,b)=>(b.Size||0)-(a.Size||0))[0];
+      if (!pkg) continue;
+
+      const distUrl = p.Distributions && (p.Distributions.English || Object.values(p.Distributions)[0]);
+
+      candidates.push({
+        pid, name: friendlyOSName(raw), seed: isSeed,
+        size: pkg.Size, url: pkg.URL,
+        date: (p.PostDate || "").slice(0, 10),
+        distUrl,
+      });
+    }
+
+    if (candidates.length === 0) {
+      throw new Error("No installer entries found in this catalog. It may not be the right catalog URL for macOS full installers.");
+    }
+
+    // Fetch each candidate's .dist file to get its real version + build.
+    const jobs = candidates.map(c => async () => {
+      if (!c.distUrl) return { version: null, build: null };
+      const text = await proxiedFetchText(c.distUrl, {
+        ttl: DIST_CACHE_MS,
+        diagnostics,
+        timeoutMs: DIST_TIMEOUT_MS,
+      });
+      return extractVersionBuild(text);
+    });
+    const vb = await runWithConcurrency(jobs, DIST_CONCURRENCY, (done, total) => {
+      statusText.textContent = `Fetching version info… ${done}/${total}`;
+    });
+    diagnostics.distFailures = vb.filter(v => v === null).length;
+
+    const results = candidates.map((c, i) => ({
+      name: c.name,
+      version: (vb[i] && vb[i].version) || "Unknown",
+      build: (vb[i] && vb[i].build) || "Unknown",
+      size: c.size,
+      date: c.date,
+      url: c.url,
+      seed: c.seed,
+    }));
+    results.sort((a, b) => b.date.localeCompare(a.date));
+
+    currentData = results;
+    render(document.getElementById("q").value);
+
+    statusEl.classList.add("ok");
+    const via = diagnostics.proxies.size ? " via " + [...diagnostics.proxies].map(proxyLabel).join(", ") : " from browser cache";
+    const cacheNote = diagnostics.cacheHits ? ` (${diagnostics.cacheHits} cached response${diagnostics.cacheHits === 1 ? "" : "s"})` : "";
+    const distNote = diagnostics.distFailures ? ` ${diagnostics.distFailures} metadata request${diagnostics.distFailures === 1 ? "" : "s"} failed; those fields show Unknown.` : "";
+    statusText.textContent = `Live data loaded — ${results.length} installer entries${via}${cacheNote}.${distNote}`;
+  } catch (e) {
+    statusEl.classList.add("err");
+    statusText.textContent = "Fetch failed: " + e.message + " — showing last known data. Check the catalog URL or use a self-hosted proxy in Advanced settings.";
+  } finally {
+    btn.disabled = false;
+    spinner.classList.remove("on");
+  }
+}
+
+/* ---------- 6. Rendering ---------- */
+const rowsEl = document.getElementById("rows");
+const rowcountEl = document.getElementById("rowcount");
+const q = document.getElementById("q");
+const showSeeds = document.getElementById("showSeeds");
+
+function render(filter = "") {
+  const f = filter.trim().toLowerCase();
+  const includeSeeds = showSeeds.checked;
+  rowsEl.innerHTML = "";
+  let shown = 0;
+
+  currentData.forEach(d => {
+    if (d.seed && !includeSeeds) return;
+    const hay = (d.name + " " + d.version + " " + d.build).toLowerCase();
+    if (f && !hay.includes(f)) return;
+    shown++;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><span class="name">${d.name}</span>${d.seed ? '<span class="flag">seed</span>' : ""}</td>
+      <td><span class="ver">${d.version}</span></td>
+      <td><span class="build">${d.build}</span></td>
+      <td class="size">${fmtSize(d.size)}</td>
+      <td class="date">${d.date}</td>
+      <td>
+        <div class="urlrow">
+          <span class="url" title="${d.url}">${d.url}</span>
+          <button class="copy" data-url="${d.url}">Copy</button>
+        </div>
+      </td>
+    `;
+    rowsEl.appendChild(tr);
+  });
+
+  if (shown === 0) {
+    rowsEl.innerHTML = `<tr><td colspan="6"><div class="empty">No matching entries.</div></td></tr>`;
+  }
+  rowcountEl.textContent = shown + " shown";
+}
+
+rowsEl.addEventListener("click", (e) => {
+  const btn = e.target.closest("button.copy");
+  if (!btn) return;
+  const url = btn.dataset.url;
+  navigator.clipboard.writeText(url).then(() => {
+    const original = btn.textContent;
+    btn.textContent = "Copied";
+    btn.classList.add("done");
+    setTimeout(() => { btn.textContent = original; btn.classList.remove("done"); }, 1200);
+  });
+});
+
+document.getElementById("fetchBtn").addEventListener("click", fetchLiveCatalog);
+document.getElementById("resetBtn").addEventListener("click", () => {
+  currentData = SAMPLE_DATA;
+  const statusEl = document.getElementById("status");
+  statusEl.classList.remove("err", "ok");
+  document.getElementById("statusText").textContent = "Showing bundled sample data from 2026‑09‑14. Click \"Fetch live data\" for the current catalog.";
+  render(q.value);
+});
+q.addEventListener("input", () => render(q.value));
+showSeeds.addEventListener("change", () => render(q.value));
+
+render();
+</script>
 </body>
 </html>
